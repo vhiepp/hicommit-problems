@@ -1,0 +1,231 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Record start time
+        id: start_time
+        run: echo "START_TIME=$(date +%s)" >> $GITHUB_ENV
+
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Send Pending Status to API
+        run: |
+          branch_name=$(echo ${{ github.ref }} | sed 's|refs/heads/||')
+          api_url="https://proxy.kakanie.com/problems/$branch_name/submission/result"
+
+          # Mã hóa file Main.java thành base64
+          encoded_code=$(base64 -w 0 Main.java)
+          
+          json_payload=$(jq -n \
+              --arg branch "$branch_name" \
+              --arg actor "${{ github.actor }}" \
+              --arg job_name "${{ github.job }}" \
+              --arg run_id "${{ github.run_id }}" \
+              --arg sha "${{ github.sha }}" \
+              --arg status "pending" \
+              --arg code "$encoded_code" \
+              '{
+                problem: $branch,
+                actor: $actor,
+                job_name: $job_name,
+                run_id: $run_id,
+                sha: $sha,
+                status: $status,
+                code: $code
+              }')
+
+          echo "JSON Payload: $json_payload"
+          
+          curl -X POST "$api_url" \
+            -H "Content-Type: application/json" \
+            -d "$json_payload"
+
+      - name: Set up Java and Utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jdk git curl
+          # Download and install jq-1.5-1
+          curl -LO https://github.com/stedolan/jq/releases/download/jq-1.5/jq-linux64
+          chmod +x jq-linux64
+          sudo mv jq-linux64 /usr/local/bin/jq
+          
+      - name: Compile Code
+        id: compile
+        run: javac Main.java
+
+      - name: Handle Compile Failure
+        if: failure()
+        run: |
+          end_time=$(date +%s)
+          start_time=${{ env.START_TIME }}
+          duration=$((end_time - start_time))
+          echo "DURATION=$duration" >> $GITHUB_ENV
+
+          branch_name=$(echo ${{ github.ref }} | sed 's|refs/heads/||')
+          api_url="https://proxy.kakanie.com/problems/$branch_name/submission/result"
+          
+          # Mã hóa file Main.java thành base64
+          encoded_code=$(base64 -w 0 Main.java)
+
+          json_payload=$(jq -n \
+            --arg branch "$branch_name" \
+            --arg actor "${{ github.actor }}" \
+            --arg job_name "${{ github.job }}" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg sha "${{ github.sha }}" \
+            --arg status "compile_error" \
+            --arg duration "$duration" \
+            --arg code "$encoded_code" \
+            '{
+              problem: $branch,
+              actor: $actor,
+              job_name: $job_name,
+              run_id: $run_id,
+              sha: $sha,
+              status: $status,
+              duration: ($duration | tonumber),
+              code: $code
+            }')
+
+          echo "JSON Payload: $json_payload"
+
+          curl -X POST "$api_url" \
+            -H "Content-Type: application/json" \
+            -d "$json_payload"
+
+      - name: Fetch Test Cases from API
+        if: success()
+        run: |
+          branch_name=$(echo ${{ github.ref }} | sed 's|refs/heads/||')
+          api_url="https://proxy.kakanie.com/problems/$branch_name/testcases"
+          curl -s $api_url -o test_cases.json
+
+      - name: Run Tests
+        if: success()
+        id: run_tests
+        run: |
+          pass_count=0
+          total_count=0
+          results="[]"
+          overall_status="passed"
+
+          jq -c '.[]' test_cases.json > test_cases_list.txt
+          while IFS= read -r test_case; do
+            id=$(echo "$test_case" | jq -r '.id')
+            input=$(echo "$test_case" | jq -r '.input')
+            expected_output=$(echo "$test_case" | jq -r '.output')
+
+            echo "Running test with ID: $id"
+            echo "Input: $input"
+            echo "Expected Output: $expected_output"
+
+            # Run the program and handle any errors
+            if ! echo "$input" | java Main > output.txt; then
+              echo "Test $id encountered an error!"
+              result_status="error"
+              actual_output="N/A"  # Do not record actual output if there's an error
+              overall_status="error"
+            else
+              # Ensure there's a newline at the end of both output files
+              sed -i -e '$a\' output.txt
+              actual_output=$(cat output.txt)
+
+              echo "Actual Output: $actual_output"
+
+              if [ "$actual_output" == "$expected_output" ]; then
+                echo "Test $id passed!"
+                result_status="passed"
+                pass_count=$((pass_count + 1))
+              else
+                echo "Test $id failed!"
+                result_status="failed"
+                overall_status="failed"
+              fi
+            fi
+
+            echo "---------------------------"
+
+            # Append the new result to the JSON array
+            results=$(echo "$results" | jq --arg id "$id" --arg status "$result_status" --arg actual_output "$actual_output" \
+              '. += [{"id": $id, "status": $status, "actual_output": $actual_output}]')
+
+            total_count=$((total_count + 1))
+          done < test_cases_list.txt
+
+          # Log results for debugging
+          echo "Results JSON: $results"
+          echo "Overall Status: $overall_status"
+          echo "Total: $total_count"
+          echo "Pass Count: $pass_count"
+          
+          # Encode JSON for safe export to GitHub Actions environment
+          encoded_results=$(echo "$results" | jq -c .)
+          echo "RESULTS_JSON=$encoded_results" >> $GITHUB_ENV
+          echo "OVERALL_STATUS=$overall_status" >> $GITHUB_ENV
+          echo "PASS_COUNT=$pass_count" >> $GITHUB_ENV
+          echo "TOTAL_COUNT=$total_count" >> $GITHUB_ENV
+
+      - name: Record end time and calculate duration
+        id: end_time
+        if: success()
+        run: |
+          end_time=$(date +%s)
+          start_time=${{ env.START_TIME }}
+          duration=$((end_time - start_time))
+          echo "DURATION=$duration" >> $GITHUB_ENV
+
+      - name: Post Test Results
+        if: success()
+        run: |
+          branch_name=$(echo ${{ github.ref }} | sed 's|refs/heads/||')
+          api_url="https://proxy.kakanie.com/problems/$branch_name/submission/result"
+          
+          # Mã hóa file Main.java thành base64
+          encoded_code=$(base64 -w 0 Main.java)
+      
+          json_payload=$(jq -n \
+              --arg branch "$branch_name" \
+              --arg actor "${{ github.actor }}" \
+              --arg job_name "${{ github.job }}" \
+              --arg run_id "${{ github.run_id }}" \
+              --arg sha "${{ github.sha }}" \
+              --arg status "$OVERALL_STATUS" \
+              --arg result "$RESULTS_JSON" \
+              --arg pass_count "$PASS_COUNT" \
+              --arg total_count "$TOTAL_COUNT" \
+              --arg duration "$DURATION" \
+              --arg code "$encoded_code" \
+              '{
+                problem: $branch,
+                actor: $actor,
+                job_name: $job_name,
+                run_id: $run_id,
+                sha: $sha,
+                status: $status,
+                result: ($result | fromjson),
+                pass_count: ($pass_count | tonumber),
+                total_count: ($total_count | tonumber),
+                duration: ($duration | tonumber),
+                code: $code
+              }')
+      
+          echo "JSON Payload: $json_payload"
+          
+          curl -X POST "$api_url" \
+            -H "Content-Type: application/json" \
+            -d "$json_payload"
+        env:
+          RESULTS_JSON: ${{ env.RESULTS_JSON }}
+          OVERALL_STATUS: ${{ env.OVERALL_STATUS }}
+          PASS_COUNT: ${{ env.PASS_COUNT }}
+          TOTAL_COUNT: ${{ env.TOTAL_COUNT }}
+          DURATION: ${{ env.DURATION }}
